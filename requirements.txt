@@ -1,0 +1,14 @@
+# Dependencies for the QQ + DeepSeek chatbot.
+# NOTE: keep this file ASCII-only -- pip reads it with the system locale
+# encoding (e.g. cp936/GBK on Chinese Windows) and would fail on non-ASCII bytes.
+#
+# Install:
+#   pip install -r requirements.txt
+#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+websockets>=12.0,<16.0
+httpx>=0.27,<1.0
+
+# Windows has no system timezone database, so zoneinfo needs this package
+# (used by the "#query <region> time" rhythm command).
+tzdata>=2024.1

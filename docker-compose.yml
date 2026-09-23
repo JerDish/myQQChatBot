@@ -1,0 +1,51 @@
+# QQ + DeepSeek 聊天机器人 —— 云端一键部署
+#
+#   cd qq-deepseek-bot
+#   docker compose up -d --build
+#
+# 说明：
+#   * NapCat 只监听容器内网，端口不映射到公网（WebUI 走 SSH 隧道访问），
+#     避免把 QQ 协议端暴露在互联网上被人扫。
+#   * 时区固定 Asia/Shanghai，否则「早上好 / 晚安 23:00」会按 UTC 跑偏 8 小时。
+#   * 两个服务都限制内存，2G 小机器上避免 NapCat 和机器人互相挤爆。
+
+services:
+  # ---------------- QQ 协议端 ----------------
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    environment:
+      - NAPCAT_UID=0
+      - NAPCAT_GID=0
+      - TZ=Asia/Shanghai
+    # 不映射到公网：WebUI 通过 SSH 隧道访问（ssh -L 6099:127.0.0.1:6099 ...）
+    expose:
+      - "3001"
+      - "6099"
+    volumes:
+      - ./data/napcat/config:/app/napcat/config
+      - ./data/napcat/QQ:/app/.config/QQ
+    mem_limit: 1400m
+    restart: unless-stopped
+
+  # ---------------- 机器人 ----------------
+  bot:
+    build:
+      context: .
+      args:
+        PIP_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple
+    container_name: qq-deepseek-bot
+    env_file: .env
+    environment:
+      # 容器内通过服务名访问 NapCat，覆盖 .env 里的 127.0.0.1
+      - ONEBOT_WS_URL=ws://napcat:3001
+      - LOG_FILE=/app/logs/bot.log
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./logs:/app/logs
+      - ./config:/app/config
+      - ./cache:/app/cache
+    mem_limit: 320m
+    depends_on:
+      - napcat
+    restart: unless-stopped

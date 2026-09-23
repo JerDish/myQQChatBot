@@ -1,0 +1,30 @@
+# 环境与密钥
+.env
+
+# 运维凭据（服务器密码、SSH 私钥、部署包）—— 绝对不能提交
+.ssh/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 运行产物
+logs/
+*.log
+
+# 群专属人格（含本地定制，不入库，保留说明文件）
+config/personas/*.md
+!config/personas/README.md
+
+# Docker 数据卷
+data/
+
+# 曲库/接口缓存
+cache/
+
+# NapCat 协议端本体（体积大，且含登录态，不适合入库）
+NapCat.Shell/
