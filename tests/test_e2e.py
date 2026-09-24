@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 import tempfile
 import time
@@ -296,6 +297,8 @@ async def main() -> int:
                 "STARTUP_GREETING_DELAY=0.2",
                 "GOODNIGHT_ENABLED=false",
                 "GOODNIGHT_TEXT=晚安，大家。祈祷明天对你来说，也是美好的一天。",
+                # 群聊插话的循环别在跑用例时自动触发，环境感知放到第 23 节组件级测
+                "AMBIENT_ENABLED=false",
                 "POKE_REPLY_ENABLED=true",
                 "POKE_BACK=false",
                 "STICKER_REPLY_ENABLED=true",
@@ -697,8 +700,52 @@ async def main() -> int:
         check("_seconds_until 解析异常格式不崩", 0 < QQBot._seconds_until("乱写") <= 86400)
         napcat.clear()
         count = await bot._broadcast("（测试晚安）", "测试播报")
-        check("广播只发给有权限的群", count == 1, f"sent={count}")
+        check("广播只发给有权限的群", count == {str(GROUP_OK)}, f"sent={count}")
         check("广播内容发到了正确的群", all(p["group_id"] == GROUP_OK for p in napcat.sent()), str(napcat.sent()))
+
+        section("18b. 定时播报发失败时会重试，而不是整晚吞掉")
+        napcat.clear()
+        real_broadcast = bot._broadcast
+        real_retries, real_gap = settings.broadcast_retries, settings.broadcast_retry_gap
+        calls = {"n": 0}
+
+        async def flaky(text, label="群发", *, skip=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return set()  # 第一轮全军覆没（模拟 23:00 恰好掉线）
+            return await real_broadcast(text, label, skip=skip)
+
+        settings.broadcast_retries = 3
+        settings.broadcast_retry_gap = 0.01
+        bot._broadcast = flaky
+        try:
+            sent = await bot._broadcast_reliable("（重试播报）", "重试播报")
+        finally:
+            bot._broadcast = real_broadcast
+            settings.broadcast_retries, settings.broadcast_retry_gap = real_retries, real_gap
+
+        check("第一轮失败后重试成功", sent == {str(GROUP_OK)}, str(sent))
+        check("确实重试了（>=2 轮）", calls["n"] >= 2, str(calls["n"]))
+        check("重试后真的发出去了", any(p["group_id"] == GROUP_OK for p in napcat.sent()), str(napcat.sent()))
+
+        section("18c. 全部成功时不浪费重试")
+        napcat.clear()
+        calls["n"] = 0
+
+        async def counting(text, label="群发", *, skip=None):
+            calls["n"] += 1
+            return await real_broadcast(text, label, skip=skip)
+
+        settings.broadcast_retries = 3
+        settings.broadcast_retry_gap = 0.01
+        bot._broadcast = counting
+        try:
+            await bot._broadcast_reliable("（一次成功）", "一次成功播报")
+        finally:
+            bot._broadcast = real_broadcast
+            settings.broadcast_retries, settings.broadcast_retry_gap = real_retries, real_gap
+        check("一次成功就只发一轮", calls["n"] == 1, str(calls["n"]))
+        check("只发了一条", len(napcat.sent()) == 1, str(napcat.sent()))
 
         # ---------------- 19. 指令系统 ----------------
         section("19. 指令：不带 @ 也能触发，且不经过 DeepSeek")
@@ -843,6 +890,123 @@ async def main() -> int:
             check("AI 回复无空行", not blanks, f"内容={txt!r}")
             check("内容没被误删", "第一行" in txt and "第二行" in txt and "第三行" in txt, txt)
         fake_ai.reply_builder = None
+
+        # ---------------- 23. 群聊氛围感知（不定时插话）----------------
+        section("23. 群聊氛围感知：读最近 5 条群聊接一句")
+        real_ambient = (
+            settings.ambient_enabled,
+            settings.ambient_messages,
+            settings.ambient_min_gap,
+            settings.ambient_group_whitelist,
+        )
+        bot._recent.clear()
+        bot._ambient_last = 0.0
+        settings.ambient_enabled = True
+        settings.ambient_messages = 5
+        settings.ambient_min_gap = 0.0
+        settings.ambient_group_whitelist = []
+        try:
+            limiter._hits.clear()
+            limiter._global.clear()
+            napcat.clear()
+            for i in range(5):
+                await napcat.push(
+                    make_event(2200 + i, group=True, user_id=USER_A, text=f"闲聊第{i+1}句", at_bot=False)
+                )
+            await wait_until(lambda: len(bot._recent.get(str(GROUP_OK), ())) >= 5, timeout=6)
+            recorded = list(bot._recent.get(str(GROUP_OK), ()))
+            check("群里的闲聊被记录下来", len(recorded) >= 5, str(len(recorded)))
+            check("未 @ 机器人时依然不回复", not napcat.sent(), str(napcat.sent()))
+            check(
+                "记录里带昵称和时间",
+                all(m.nickname and m.ts > 0 for m in recorded),
+                str([(m.nickname, round(m.ts)) for m in recorded[:2]]),
+            )
+
+            # 黑名单群不参与
+            blocked_event = make_event(2210, group=True, user_id=USER_A, text="黑名单群说话", at_bot=False)
+            blocked_event["group_id"] = GROUP_BLOCKED
+            await napcat.push(blocked_event)
+            await asyncio.sleep(0.3)
+            check("黑名单群不记录", not bot._recent.get(str(GROUP_BLOCKED)), str(bot._recent.get(str(GROUP_BLOCKED))))
+
+            # 指令不进去（免得模型拿 "/今日老婆" 当闲聊接）
+            await napcat.push(make_event(2211, group=True, user_id=USER_A, text="/时间", at_bot=False))
+            await wait_until(lambda: any(a["action"] == "send_group_msg" for a in napcat.actions), timeout=8)
+            check(
+                "指令不进闲聊缓冲",
+                all(not m.text.lstrip().startswith(("/", "\\")) for m in bot._recent.get(str(GROUP_OK), ())),
+                str([m.text for m in bot._recent.get(str(GROUP_OK), ())]),
+            )
+
+            # 主动插话一轮
+            napcat.clear()
+            before_calls = fake_ai.counter
+            await bot._ambient_round()
+            check("插话走了 DeepSeek", fake_ai.counter > before_calls, f"{before_calls} -> {fake_ai.counter}")
+            got = await wait_until(lambda: len(napcat.sent()) >= 1, timeout=6)
+            check("插话发到了群里", got, str(napcat.sent()))
+            if got:
+                check("插话发的是本群", napcat.sent()[0]["group_id"] == GROUP_OK, str(napcat.sent()))
+                check("插话用的是 send_group_msg", any(a["action"] == "send_group_msg" for a in napcat.actions))
+                said = segments_to_text(napcat.sent()[0]["message"])
+                check("插话内容非空", bool(said.strip()), said)
+            if fake_ai.requests:
+                prompt = "\n".join(m["content"] for m in fake_ai.requests[-1]["messages"])
+                check("提示里带上了聊天记录", "闲聊第5句" in prompt, prompt[:200])
+                check("提示里带上了每条的时间", bool(re.search(r"\[\d{2}:\d{2}\]", prompt)), prompt[:200])
+                check("提示里说明了没人 @ 你", "没有人 @ 你" in prompt, prompt[:160])
+
+            # 记录不足 5 条 → 沉默
+            bot._recent.clear()
+            await napcat.push(make_event(2220, group=True, user_id=USER_A, text="只有这一句", at_bot=False))
+            await wait_until(lambda: len(bot._recent.get(str(GROUP_OK), ())) >= 1, timeout=6)
+            napcat.clear()
+            before_calls = fake_ai.counter
+            await bot._ambient_round()
+            check("记录不足 5 条时不插话", fake_ai.counter == before_calls, f"{before_calls} -> {fake_ai.counter}")
+            check("记录不足时也没发消息", not napcat.sent(), str(napcat.sent()))
+
+            # 只配置了的群才主动说话
+            bot._recent.clear()
+            for i in range(5):
+                await napcat.push(
+                    make_event(2230 + i, group=True, user_id=USER_A, text=f"另一批闲聊{i}", at_bot=False)
+                )
+            await wait_until(lambda: len(bot._recent.get(str(GROUP_OK), ())) >= 5, timeout=6)
+            napcat.clear()
+            before_calls = fake_ai.counter
+            settings.ambient_group_whitelist = ["99999999"]
+            await bot._ambient_round()
+            check("不在插话白名单里的群保持沉默", fake_ai.counter == before_calls, str(settings.ambient_group_whitelist))
+            check("白名单外不发消息", not napcat.sent(), str(napcat.sent()))
+            settings.ambient_group_whitelist = [str(GROUP_OK)]
+
+            # 消息摘要：图片 / 表情 / 语音都要变成模型看得懂的描述
+            check(
+                "图片消息可读",
+                bot._message_digest([{"type": "image", "data": {}}]) == "（发了一张图片）",
+                bot._message_digest([{"type": "image", "data": {}}]),
+            )
+            check(
+                "表情包带上摘要",
+                bot._message_digest([{"type": "mface", "data": {"summary": "微笑"}}]) == "（发了一个表情包：微笑）",
+                bot._message_digest([{"type": "mface", "data": {"summary": "微笑"}}]),
+            )
+            check(
+                "语音可读",
+                bot._message_digest([{"type": "record", "data": {}}]) == "（发了一条语音）",
+                bot._message_digest([{"type": "record", "data": {}}]),
+            )
+            check("空消息不记录", bot._message_digest([{"type": "reply", "data": {}}]) == "")
+        finally:
+            (
+                settings.ambient_enabled,
+                settings.ambient_messages,
+                settings.ambient_min_gap,
+                settings.ambient_group_whitelist,
+            ) = real_ambient
+            bot._recent.clear()
 
     finally:
         bot_task.cancel()

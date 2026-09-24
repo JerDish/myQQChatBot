@@ -6,8 +6,10 @@ import asyncio
 import random
 import re
 import time
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Set, Tuple
 
 from . import clock
 from .commands import CommandContext, CommandDispatcher, parse_command, registry
@@ -41,6 +43,19 @@ log = get_logger(__name__)
 
 
 AT_PLACEHOLDER = "\u0000AT\u0000"
+
+
+@dataclass
+class RecentMessage:
+    """群聊氛围感知用的一条聊天记录。"""
+
+    ts: float
+    nickname: str
+    text: str
+
+    def line(self) -> str:
+        return f"[{datetime.fromtimestamp(self.ts).strftime('%H:%M')}] {self.nickname}: {self.text}"
+
 
 # 去掉 QQ 不渲染的 Markdown 标记，让回复更自然
 _MD_PATTERNS: Sequence[Tuple[str, str]] = (
@@ -85,6 +100,10 @@ class QQBot:
         self._tasks: Set[asyncio.Task] = set()
         # 启动问候 / 晚安排程只在进程启动时挂一次，断线重连不重复
         self._scheduled = False
+        # 群聊氛围感知：{gid: deque[RecentMessage]}，只留最近一小段
+        self._recent: Dict[str, Deque["RecentMessage"]] = {}
+        # 上次主动插话的时间戳，用来控制「两段主动发言之间的间隔」
+        self._ambient_last: float = 0.0
 
         # 指令系统 + 外部数据源
         self._cmd_http: Optional[HttpClient] = None
@@ -122,6 +141,7 @@ class QQBot:
         self._spawn(self._startup_greeting_task(), "启动问候")
         self._spawn(self._goodnight_loop(), "晚安排程")
         self._spawn(self._news_loop(), "新闻播报")
+        self._spawn(self._ambient_loop(), "群聊插话")
 
     # ==================================================================
     # 每日新闻播报
@@ -152,7 +172,7 @@ class QQBot:
                     item_chars=self.settings.news_item_chars,
                 )
                 text = render_news(digest)
-                await self._broadcast(text, label="今日新闻")
+                await self._broadcast_reliable(text, label="今日新闻")
             except CommandDataError as exc:
                 log.warning("新闻播报取数据失败: %s", exc)
             except asyncio.CancelledError:
@@ -221,7 +241,7 @@ class QQBot:
             )
             await asyncio.sleep(delay)
             try:
-                await self._broadcast(text, label="晚安播报")
+                await self._broadcast_reliable(text, label="晚安播报")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -271,34 +291,246 @@ class QQBot:
             except OSError:
                 pass
 
-    async def _broadcast(self, text: str, label: str = "群发") -> int:
-        """把一句话发给机器人所在的所有（有权限的）群。"""
+    async def _broadcast(self, text: str, label: str = "群发", *, skip: Optional[Set[str]] = None) -> Set[str]:
+        """把一句话发给机器人所在的所有（有权限的）群。
+
+        返回**发送成功的群号集合**（不是数量）—— 这样上层就能只对失败的群重试，
+        不会给已经收到的群重复发一遍。
+        """
         try:
             groups = await self.client.get_group_list()
         except OneBotError as exc:
             log.error("%s失败：拿不到群列表（%s）", label, exc)
-            return 0
+            return set()
 
+        done = skip or set()
         targets = [
             str(g.get("group_id"))
             for g in groups
-            if g.get("group_id") is not None and self.settings.group_enabled(str(g.get("group_id")))
+            if g.get("group_id") is not None
+            and self.settings.group_enabled(str(g.get("group_id")))
+            and str(g.get("group_id")) not in done
         ]
         if not targets:
-            log.warning("%s：没有可发送的群", label)
-            return 0
+            log.warning("%s：没有可发送的群（已成功 %d 个）", label, len(done))
+            return set()
 
-        sent = 0
+        sent: Set[str] = set()
         clean = self._clean(text, self.settings.strip_markdown)
         for group_id in targets:
             try:
                 await self.client.send_group_msg(group_id, [text_segment(clean)])
-                sent += 1
+                sent.add(group_id)
+                log.debug("%s → 群 %s 发送成功", label, group_id)
             except OneBotError as exc:
                 log.error("向群 %s 发送%s失败: %s", group_id, label, exc)
             await asyncio.sleep(1.2)  # 群之间留间隔，降低风控概率
-        log.info("%s已发送到 %d/%d 个群", label, sent, len(targets))
+
+        failed = set(targets) - sent
+        log.info(
+            "%s已发送到 %d/%d 个群%s",
+            label,
+            len(sent),
+            len(targets) + len(done),
+            f"（本轮失败：{'、'.join(sorted(failed))}）" if failed else "",
+        )
         return sent
+
+    async def _broadcast_reliable(self, text: str, label: str) -> Set[str]:
+        """定时播报专用：没发成功的群会过一会儿重试，而不是整晚/整天吞掉。
+
+        原来的写法是「发一次，失败了就等明天」—— 而机器人被腾讯风控踢下线的
+        间隔平均才 3 小时，23:00 恰好撞上掉线窗口的概率并不低，
+        那样一整晚的晚安就只留下一行 ERROR 日志。
+
+        另外：单次失败是常态（NapCat 偶尔回 retcode=1200 EventChecker Failed），
+        所以这里把「失败」当成要重试的情况，而不是「今天就算了」。
+        """
+        retries = max(1, int(self.settings.broadcast_retries))
+        gap = max(5.0, float(self.settings.broadcast_retry_gap))
+
+        done: Set[str] = set()
+        for attempt in range(1, retries + 1):
+            done |= await self._broadcast(text, label, skip=done)
+            if attempt >= retries:
+                break
+            try:
+                remaining = {
+                    str(g.get("group_id"))
+                    for g in await self.client.get_group_list()
+                    if g.get("group_id") is not None
+                    and self.settings.group_enabled(str(g.get("group_id")))
+                } - done
+            except OneBotError:
+                remaining = {"?"}  # 拿不到群列表（多半是掉线），下一轮再试
+            if not remaining:
+                break
+            log.warning(
+                "%s：还有 %d 个群没发出，%.0f 秒后重试（第 %d/%d 轮）",
+                label,
+                len(remaining),
+                gap,
+                attempt + 1,
+                retries,
+            )
+            await asyncio.sleep(gap)
+
+        log.info("%s最终成功 %d 个群", label, len(done))
+        return done
+
+    # ==================================================================
+    # 群聊氛围感知：每隔一段时间自己看几条聊天记录，插一句
+    # ==================================================================
+    def _message_digest(self, segments: Sequence[Dict[str, Any]]) -> str:
+        """把一条消息压成一行文字。
+
+        extract_text 已经把图片 / 表情包 / 语音转成了「（发了一张图片）」这类
+        人话描述，所以这里不用再自己造占位符，直接用它就行。
+        """
+        return extract_text(segments, self.self_id).strip()
+
+    def _remember(self, group_id: str, nickname: str, text: str) -> None:
+        """把群里的一条消息记进环形缓冲，供主动插话时参考。"""
+        text = (text or "").strip()
+        if not text:
+            return
+        size = max(4, int(self.settings.ambient_messages) * 4)
+        buf = self._recent.get(group_id)
+        if buf is None:
+            buf = deque(maxlen=size)
+            self._recent[group_id] = buf
+        buf.append(RecentMessage(ts=time.time(), nickname=nickname or "某人", text=text[:120]))
+
+        # 群特别多的时候别把内存撑爆：只留最近活跃的 200 个群
+        if len(self._recent) > 200:
+            order = sorted(self._recent, key=lambda g: self._recent[g][-1].ts if self._recent[g] else 0.0)
+            for gid in order[: len(self._recent) - 200]:
+                self._recent.pop(gid, None)
+
+    def _ambient_allowed(self, group_id: str) -> bool:
+        if not self.settings.ambient_enabled:
+            return False
+        if not self.settings.group_enabled(group_id):
+            return False
+        whitelist = self.settings.ambient_group_whitelist
+        return not whitelist or group_id in whitelist
+
+    def _ambient_fresh_count(self, group_id: str) -> int:
+        """窗口内还剩几条（只用来打日志解释为什么没插话）。"""
+        buf = self._recent.get(group_id)
+        if not buf:
+            return 0
+        cutoff = time.time() - max(60.0, float(self.settings.ambient_window))
+        return sum(1 for msg in buf if msg.ts >= cutoff)
+
+    def _ambient_transcript(self, group_id: str) -> List[RecentMessage]:
+        """取最近窗口内的最后 N 条；不够 N 条就返回空（说明群里没什么可接的）。"""
+        buf = self._recent.get(group_id)
+        if not buf:
+            return []
+        cutoff = time.time() - max(60.0, float(self.settings.ambient_window))
+        fresh = [msg for msg in buf if msg.ts >= cutoff]
+        need = max(1, int(self.settings.ambient_messages))
+        if len(fresh) < need:
+            return []
+        return fresh[-need:]
+
+    async def _ambient_loop(self) -> None:
+        if not self.settings.ambient_enabled:
+            return
+        interval = max(60.0, float(self.settings.ambient_interval))
+        jitter = max(0.0, float(self.settings.ambient_jitter))
+        log.info(
+            "群聊插话已排程：每 %.0f 秒读一次群聊（每次 %d 条，随机抖动 %.0f 秒）",
+            interval,
+            self.settings.ambient_messages,
+            jitter,
+        )
+        while True:
+            await asyncio.sleep(interval + (random.uniform(0, jitter) if jitter else 0.0))
+            try:
+                await self._ambient_round()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("群聊插话失败")
+
+    async def _ambient_round(self) -> None:
+        if self.self_id is None:
+            return  # 还没登录，这一轮别白跑
+        need = max(1, int(self.settings.ambient_messages))
+        log.info(
+            "群聊插话：本轮观察 %d 个群，缓冲共 %d 条",
+            len(self._recent),
+            sum(len(buf) for buf in self._recent.values()),
+        )
+        gap = max(0.0, float(self.settings.ambient_min_gap))
+        for group_id in sorted(self._recent):
+            if not self._ambient_allowed(group_id):
+                continue
+            transcript = self._ambient_transcript(group_id)
+            if not transcript:
+                # 说清楚为什么没插话，不然用户只会看到「它一直不说话」
+                log.info(
+                    "群 %s 最近没什么可接的话：窗口内 %d 条，需要 %d 条，跳过",
+                    group_id,
+                    self._ambient_fresh_count(group_id),
+                    need,
+                )
+                continue
+            waited = time.time() - self._ambient_last
+            if waited < gap:
+                await asyncio.sleep(gap - waited)
+            await self._ambient_speak(group_id, transcript)
+            self._ambient_last = time.time()
+
+    async def _ambient_speak(self, group_id: str, transcript: Sequence[RecentMessage]) -> None:
+        persona = self.personas.get(group_id)
+        if self.settings.deepseek_extra_prompt:
+            persona = f"{persona}\n\n{self.settings.deepseek_extra_prompt}"
+
+        limit = max(10, int(self.settings.ambient_max_chars))
+        system = (
+            f"{persona}\n\n"
+            "[补充规则] 这次没有人 @ 你。你只是在群里潜水，刚看到下面几条聊天记录。"
+            "像一个普通群友那样自然接一句就行："
+            f"控制在 {limit} 字以内，口语化，别复述别人说过的话，"
+            "不要 @ 任何人，不要用括号写动作或表情，不要追问细节，"
+            "不要提「聊天记录」「时间」这些字眼，也不要每句都提现在是几点。"
+        )
+        lines = "\n".join(msg.line() for msg in transcript)
+        messages = [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": f"（{clock.context_line()}）群里最近这几句：\n{lines}\n\n你接一句：",
+            },
+        ]
+
+        try:
+            reply = await self.ai.chat(messages)
+        except DeepSeekError as exc:
+            log.error("群 %s 插话生成失败: %s", group_id, exc)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("群 %s 插话生成异常", group_id)
+            return
+
+        say = self._clean(reply, self.settings.strip_markdown).strip()
+        if not say:
+            log.info("群 %s 插话结果为空，跳过", group_id)
+            return
+        if len(say) > limit * 2:  # 模型偶尔不听话，硬兜一下
+            say = say[: limit * 2].rstrip() + "…"
+
+        try:
+            await self.client.send_group_msg(group_id, [text_segment(say)])
+        except OneBotError as exc:
+            log.error("群 %s 插话发送失败: %s", group_id, exc)
+            return
+        log.info("群 %s 主动插话（读了 %d 条记录）：%s", group_id, len(transcript), say)
 
     # ==================================================================
     # 事件入口
@@ -367,6 +599,12 @@ class QQBot:
         if user_id in self.settings.ignore_user_ids:
             log.debug("用户 %s 在忽略名单中", user_id)
             return
+
+        # 氛围感知：把群里的闲聊记下来（不管这条会不会触发回复），
+        # 每半小时左右拿去给模型「接一句话」用。
+        digest = self._message_digest(segments)
+        if digest and not digest.lstrip().startswith(("/", "\\")):
+            self._remember(group_id, sender_display_name(event), digest)
 
         # 需求 2：群里只有被 @ 时才响应。
         # 例外一：`/xxx` 或 `\xxx` 开头的指令，不需要 @

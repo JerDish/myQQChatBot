@@ -187,6 +187,30 @@ class Settings:
     news_item_chars: int = 20
     news_jitter: float = 300.0
 
+    # ---------- 定时播报的发送重试 ----------
+    # 23:00 / 12:00 恰好撞上掉线时，原来当晚/当天就直接吞掉了，
+    # 现在按这个间隔重试，直到所有群都发出去或者用完次数。
+    broadcast_retries: int = 8
+    broadcast_retry_gap: float = 300.0
+
+    # ---------- 群聊氛围感知（不定时插话）----------
+    # 除了被 @，机器人还会每隔一段时间自己看几条群聊，然后插一句。
+    ambient_enabled: bool = True
+    # 每隔多少秒看一次群聊
+    ambient_interval: float = 1800.0
+    # 每轮再加一点随机抖动，别精确到同一秒
+    ambient_jitter: float = 120.0
+    # 一次读几条聊天记录（连同每条的时间一起给模型）
+    ambient_messages: int = 5
+    # 插话的字数上限
+    ambient_max_chars: int = 60
+    # 超过这个秒数的旧消息不算（群里太久没人说话就别插嘴）
+    ambient_window: float = 1800.0
+    # 只在这些群里主动说话；留空 = 所有允许的群
+    ambient_group_whitelist: List[str] = field(default_factory=list)
+    # 两段主动发言之间至少隔这么多秒，避免一轮里对着好几个群连发
+    ambient_min_gap: float = 120.0
+
     # ---------- 输出 ----------
     max_reply_chars: int = 1200
     reply_with_quote: bool = False
@@ -271,6 +295,16 @@ class Settings:
             news_domestic=env.int("NEWS_DOMESTIC", 5),
             news_item_chars=env.int("NEWS_ITEM_CHARS", 20),
             news_jitter=env.float("NEWS_JITTER", 300.0),
+            broadcast_retries=env.int("BROADCAST_RETRIES", 8),
+            broadcast_retry_gap=env.float("BROADCAST_RETRY_GAP", 300.0),
+            ambient_enabled=env.bool("AMBIENT_ENABLED", True),
+            ambient_interval=env.float("AMBIENT_INTERVAL", 1800.0),
+            ambient_jitter=env.float("AMBIENT_JITTER", 120.0),
+            ambient_messages=env.int("AMBIENT_MESSAGES", 5),
+            ambient_max_chars=env.int("AMBIENT_MAX_CHARS", 60),
+            ambient_window=env.float("AMBIENT_WINDOW", 1800.0),
+            ambient_group_whitelist=env.id_list("AMBIENT_GROUP_WHITELIST"),
+            ambient_min_gap=env.float("AMBIENT_MIN_GAP", 120.0),
             max_reply_chars=env.int("MAX_REPLY_CHARS", 1200),
             reply_with_quote=env.bool("REPLY_WITH_QUOTE", False),
             strip_markdown=env.bool("STRIP_MARKDOWN", True),
@@ -331,7 +365,17 @@ class Settings:
             f"指令系统      : {'开启' if self.commands_enabled else '关闭'}（/ 或 \\ 开头，不经过 AI）",
             f"语音转文字    : {'开启' if self.voice_enabled else '关闭'}（QQ 自带识别）",
             f"引用读取      : {'开启' if self.quote_read_enabled else '关闭'}",
-            f"新闻播报      : {self.news_time if self.news_enabled else '关闭'}",
+            f"新闻播报      : {self.news_time if self.news_enabled else '关闭'}"
+            f"{f'（国外 {self.news_foreign} 条 + 国内 {self.news_domestic} 条，每条约 {self.news_item_chars} 字）' if self.news_enabled else ''}",
+            f"群聊插话      : "
+            + (
+                f"开启（每 {int(self.ambient_interval)} 秒读最近 {self.ambient_messages} 条，"
+                f"约 {self.ambient_max_chars} 字"
+                + (f"；仅限群 {self.ambient_group_whitelist}" if self.ambient_group_whitelist else "")
+                + "）"
+                if self.ambient_enabled
+                else "关闭"
+            ),
         ]
         return "\n".join(lines)
 
