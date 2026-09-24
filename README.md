@@ -24,6 +24,7 @@ QQ 客户端 ──▶ NapCat（协议端） ──正向 WebSocket──▶ 本
 | 戳一戳回应 | 有人戳机器人（`notice_type=notify` + `sub_type=poke`，且被戳的是自己） | `POKE_REPLY_ENABLED` / `POKE_BACK` |
 | 表情包回应 | 被 @ 或私聊收到表情包（`mface` / 带 summary 的图片） | `STICKER_REPLY_ENABLED` / `STICKER_RANDOM_CHANCE` |
 | 晚安播报 | 每天到达设定时间，向所有群发一句 | `GOODNIGHT_TIME` / `GOODNIGHT_TEXT` / `GOODNIGHT_JITTER` |
+| 每日新闻 | 每天 12:00 发一条国内外要闻摘要（国外 5 条 + 国内 5 条，每条约 20 字） | `NEWS_TIME` / `NEWS_FOREIGN` / `NEWS_DOMESTIC` / `NEWS_ITEM_CHARS` |
 | 启动问候 | 每次进程启动后（断线重连不重复） | `STARTUP_GREETING` / `STARTUP_GREETING_DELAY` |
 
 音游查分（集成了提比 Tippy 的查分能力）：
@@ -401,6 +402,71 @@ STARTUP_GREETING_MIN_INTERVAL=0 # 0 = 每次启动都发
 
 ---
 
+## 每日新闻播报
+
+每天 **12:00** 向所有群发一条要闻摘要：**国外 5 条 + 国内 5 条，每条约 20 字**。
+
+```
+今日要闻（09-25）
+【国外】
+· 9名哈萨克斯坦军人在里海军事演习期间遇难
+· 荷兰西尼罗病毒疫情蔓延 死亡病例增至5例
+【国内】
+· 国家对成品油价格实施调控
+· 中国知名表演艺术家游本昌去世 享年93岁
+```
+
+配置项：
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `NEWS_ENABLED` | `true` | 总开关 |
+| `NEWS_TIME` | `12:00` | 24 小时制 |
+| `NEWS_FOREIGN` | `5` | 国外几条 |
+| `NEWS_DOMESTIC` | `5` | 国内几条 |
+| `NEWS_ITEM_CHARS` | `20` | 每条大约多少字 |
+| `NEWS_JITTER` | `300` | 随机延迟上限（秒），别精确到同一秒 |
+
+手动触发：`/新闻`（别名 `news` / `今日新闻`）。
+
+### 数据源为什么用中新网
+
+新闻源用的是**中新网的 RSS 分栏**，不是聚合 API：
+
+```
+国内  https://www.chinanews.com.cn/rss/importnews.xml   （要闻导读）
+      https://www.chinanews.com.cn/rss/china.xml        （时政，兜底）
+      https://www.chinanews.com.cn/rss/scroll-news.xml  （即时，兜底）
+国外  https://www.chinanews.com.cn/rss/world.xml        （国际）
+```
+
+选型踩过的坑，别再走一遍：
+
+- **新浪 RSS 是死的**：`rss.sina.com.cn/news/{china,world}/focus15.xml` 返回 200，
+  但内容停在 **2018 年**（"光纤之父高锟离世"）。
+- **人民网 RSS 也是死的**：停在 **2025-06**（"欧洲央行宣布下调欧元区关键利率"）。
+- **中新网是活的**：`pubDate` 就是当天，30 条/栏，纯 UTF-8 XML。
+- 参考消息、联合早报、RSSHub 公共实例在国内服务器上**直接连不通**。
+
+抓取链路是「按顺序试兜底链，凑够条数就停」：某个源挂了只记一条 warning，
+不影响其它源；某一栏彻底取不到也不阻断播报 —— 只发另一栏，有半份好过一份都没有。
+
+### 「每条约 20 字」是怎么做到的
+
+RSS 标题本来就是编辑写好的短标题，所以**不调 AI，纯本地处理**，没有失败面：
+
+1. 先按原顺序挑**长度已经合适**的（≤ 28 字），避免为了凑数硬砍；
+2. 不够才从长标题里裁，裁剪优先在句读（`，、；。！？`）处断开，实在没得断才加 `…`。
+
+想先看看今天会发出去什么，不用等到 12:00：
+
+```bash
+python _preview_news.py            # 本地
+docker compose exec -T bot python _preview_news.py   # 云端
+```
+
+---
+
 ## 时间感知
 
 机器人会**读取本机系统时间**（`bot/clock.py`），并在四处使用它：
@@ -411,6 +477,7 @@ STARTUP_GREETING_MIN_INTERVAL=0 # 0 = 每次启动都发
 | 模型上下文 | 每轮对话都会把「现在是 2026-09-22 12:47（周二中午），你此刻的状态：精神一般」注入提示词，所以它能自然回答「现在几点」、并在深夜提醒你早点睡 |
 | 时间指令 | `@机器人 #现在几点` / `#查询时间` 返回本机时间；`#查询日本时间` 返回指定时区时间 |
 | 晚安播报 | 每天 23:00（可配）触发 |
+| 每日新闻 | 每天 12:00（可配）触发 |
 
 时段划分（改的话在 `bot/clock.py`）：
 
@@ -762,6 +829,7 @@ qq-deepseek-bot/
 │  └─ test_rhythm.py       # 音游模块离线自测（固定数据，不联网）
 ├─ Dockerfile
 ├─ docker-compose.yml
+├─ _preview_news.py         # 真连一次新闻源，预览 12:00 会播出去什么
 ├─ scripts/
 │  ├─ napcat-watchdog.sh         # ★ 掉线自愈看门狗（systemd timer 每分钟跑）
 │  ├─ install-watchdog.sh        #   安装/卸载上面那个 systemd 服务

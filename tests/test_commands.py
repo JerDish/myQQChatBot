@@ -113,21 +113,85 @@ def test_fortune_variety() -> None:
     check("宜忌已去掉「死磕一首歌」", "死磕" not in joined)
     check("宜忌含二次元活动", any(k in joined for k in ["补番", "抽卡", "漫展", "手办", "galgame"]))
 
-    section("5. 新闻摘要裁剪")
-    from bot.commands.sources import NewsDigest, summarize_news
+    section("5. 每日新闻（国外 5 条 + 国内 5 条，每条约 20 字）")
+    from bot.commands.sources import (
+        NewsDigest,
+        NewsSection,
+        _pick_titles,
+        _shorten,
+        parse_rss_titles,
+        render_news,
+    )
 
-    digest = NewsDigest(date="2026-09-23", items=[f"这是第{i}条测试新闻内容，用于验证摘要裁剪逻辑是否正常工作" for i in range(15)])
-    text = summarize_news(digest, max_chars=200)
-    check("摘要在 200 字左右", len(text) <= 400, f"len={len(text)}")
-    check("摘要含日期", "2026-09-23" in text)
-    check("摘要有条目", "·" in text)
+    # 标题裁剪：本来就在范围内的一字不动
+    check("短标题不截断", _shorten("国家对成品油价格实施调控", 20) == "国家对成品油价格实施调控")
+    # 太长时优先在句读处断开，而不是硬切
+    long_title = "全国铁路中秋国庆假期预计发送旅客2.84亿人次，日均计划开行旅客列车约1.3万列"
+    cut = _shorten(long_title, 20)
+    check("长标题在句读处断开", cut == "全国铁路中秋国庆假期预计发送旅客2.84亿人次", cut)
+    check("裁剪后长度接近 20 字", 10 <= len(cut) <= 28, f"len={len(cut)}")
+    # 没有句读可断时兜底加省略号
+    no_break = _shorten("哈萨克斯坦国防部证实九名军人在里海军事演习期间因直升机失事遇难", 20)
+    check("无句读时截断并加省略号", no_break.endswith("…"), no_break)
 
-    empty = NewsDigest(date="", items=[])
-    try:
-        summarize_news(empty)
-        check("空新闻应报错", False)
-    except Exception:
-        check("空新闻应报错", True)
+    # 选条：优先挑长度合适的，避免为了凑数硬砍
+    pool = [
+        "市场监管总局：1至8月全国新设经营主体1550.2万户",
+        "国家对成品油价格实施调控",
+        "中秋国庆假期全社会跨区域人员流动量将达27.8亿人次",
+        "中国知名表演艺术家游本昌去世",
+        "这是一个特别特别特别特别特别特别特别长的标题用来测试排序逻辑",
+    ]
+    picked = _pick_titles(pool, 5, 20)
+    check("选够 5 条", len(picked) == 5, str(picked))
+    check("选中了短标题", "国家对成品油价格实施调控" in picked)
+    check("长标题被排到最后", picked[-1].startswith("这是一个特别特别"), str(picked))
+    check("每条都接近 20 字", all(len(t) <= 30 for t in picked), str([len(t) for t in picked]))
+
+    # RSS 解析
+    sample_rss = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel><title>中新网国际新闻</title>
+      <item><title>9名哈萨克斯坦军人在里海军事演习期间遇难</title></item>
+      <item><title><![CDATA[荷兰西尼罗病毒疫情蔓延 死亡病例增至5例]]></title></item>
+      <item><title>   </title></item>
+    </channel></rss>"""
+    titles = parse_rss_titles(sample_rss)
+    check("RSS 解析出 2 条（空白标题被跳过）", len(titles) == 2, str(titles))
+    check("RSS 里 CDATA 标题正常", "荷兰西尼罗病毒疫情蔓延 死亡病例增至5例" in titles[1])
+
+    # 渲染
+    digest = NewsDigest(
+        date="09-24",
+        sections=[
+            NewsSection(label="国外", items=["9名哈萨克斯坦军人在里海军事演习期间遇难"] * 1),
+            NewsSection(label="国内", items=["国家对成品油价格实施调控", "中国知名表演艺术家游本昌去世"]),
+        ],
+    )
+    text = render_news(digest)
+    check("渲染含日期", "09-24" in text)
+    check("含国外栏", "【国外】" in text)
+    check("含国内栏", "【国内】" in text)
+    check("国外排在前面", text.index("【国外】") < text.index("【国内】"))
+    check("条目用 · 开头", "· " in text)
+    check("共 3 条", text.count("· ") == 3, str(text.count("· ")))
+    body_lines = [ln for ln in text.splitlines() if ln.startswith("· ")]
+    check("每条都在 20 字上下", all(len(ln) - 2 <= 30 for ln in body_lines), str([len(ln) for ln in body_lines]))
+
+    for empty in (NewsDigest(date="", sections=[]),
+                  NewsDigest(date="01-01", sections=[NewsSection(label="国内", items=[])])):
+        try:
+            render_news(empty)
+            check("空新闻应报错", False)
+        except Exception:
+            check("空新闻应报错", True)
+
+    # 配置默认值就是需求里的：12:00 / 5 / 5 / 20
+    from bot.config import Settings
+    defaults = Settings()
+    check("默认播报时间 12:00", defaults.news_time == "12:00", defaults.news_time)
+    check("默认国外 5 条", defaults.news_foreign == 5, str(defaults.news_foreign))
+    check("默认国内 5 条", defaults.news_domestic == 5, str(defaults.news_domestic))
+    check("默认每条 20 字", defaults.news_item_chars == 20, str(defaults.news_item_chars))
 
 
 def test_characters() -> None:

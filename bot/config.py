@@ -179,8 +179,12 @@ class Settings:
 
     # ---------- 每日新闻播报 ----------
     news_enabled: bool = True
-    news_time: str = "10:00"
-    news_max_chars: int = 200
+    news_time: str = "12:00"
+    # 国外、国内各几条
+    news_foreign: int = 5
+    news_domestic: int = 5
+    # 每条大约多少字（标题式短句，不是整段）
+    news_item_chars: int = 20
     news_jitter: float = 300.0
 
     # ---------- 输出 ----------
@@ -262,8 +266,10 @@ class Settings:
             voice_enabled=env.bool("VOICE_ENABLED", True),
             quote_read_enabled=env.bool("QUOTE_READ_ENABLED", True),
             news_enabled=env.bool("NEWS_ENABLED", True),
-            news_time=env.str("NEWS_TIME", "10:00"),
-            news_max_chars=env.int("NEWS_MAX_CHARS", 200),
+            news_time=env.str("NEWS_TIME", "12:00"),
+            news_foreign=env.int("NEWS_FOREIGN", 5),
+            news_domestic=env.int("NEWS_DOMESTIC", 5),
+            news_item_chars=env.int("NEWS_ITEM_CHARS", 20),
             news_jitter=env.float("NEWS_JITTER", 300.0),
             max_reply_chars=env.int("MAX_REPLY_CHARS", 1200),
             reply_with_quote=env.bool("REPLY_WITH_QUOTE", False),

@@ -2,8 +2,12 @@
 
 已实测可用的接口（本地与阿里云均通）：
     网易云搜索   music.163.com      ~0.3s
-    60s 新闻     60s.viki.moe        ~1.5s
+    中新网 RSS   chinanews.com.cn   ~0.5s   国内 / 国际分栏，每天更新
     萌娘百科      moegirl.icu         ~0.8s   ← 主站 zh.moegirl.org.cn 不稳，用这个镜像
+
+新闻源选型说明：RSS 是给机器读的，最省事。但国内大部分媒体的 RSS 早就停更了，
+实测新浪（rss.sina.com.cn 停在 2018）、人民网（停在 2025-06）都还在返回 200，
+内容却是几年前的老闻 —— 只有中新网的几个栏目是真在更新的，所以新闻用它。
 
 注意：bangumi (bgm.tv) 在本机与云端都被 DNS 污染（解析到 Facebook/Dropbox 的 IP），
 所以「今日老婆」改用萌娘百科。
@@ -17,7 +21,9 @@ import json
 import random
 import re
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import quote, urlencode
 
@@ -34,7 +40,6 @@ except ImportError:  # pragma: no cover
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 
 NETEASE_SEARCH = "https://music.163.com/api/search/get/web"
-NEWS_60S = "https://60s.viki.moe/v2/60s"
 
 
 class CommandDataError(RuntimeError):
@@ -90,6 +95,17 @@ class HttpClient:
             return resp.json()
         except ValueError as exc:
             raise CommandDataError("接口返回了非 JSON 内容") from exc
+
+    async def get_text(self, url: str, *, headers: Optional[Dict[str, str]] = None) -> str:
+        client = await self._c(url)
+        try:
+            resp = await client.get(url, headers=headers)
+        except Exception as exc:
+            raise CommandDataError(f"请求失败: {exc}") from exc
+        if resp.status_code >= 400:
+            raise CommandDataError(f"接口返回 {resp.status_code}")
+        # RSS 声明的是 UTF-8，但响应头不一定带 charset，这里直接按 UTF-8 解
+        return resp.content.decode("utf-8", errors="replace")
 
     async def head_ok(self, url: str) -> bool:
         """检查图片链接是否可下载（用于过滤失效的封面）。"""
@@ -211,54 +227,175 @@ def _parse_netease_songs(items: List[Any]) -> List[Song]:
 
 
 # ---------------------------------------------------------------------------
-# 60s 新闻
+# 每日新闻（国内 + 国外）
 # ---------------------------------------------------------------------------
+# 中新网 RSS 各栏目，实测在国内服务器上可直连、且每天更新。
+# 按顺序作为兜底链：前一个源挂了或者条数不够，就用下一个源补。
+NEWS_DOMESTIC_FEEDS = [
+    "https://www.chinanews.com.cn/rss/importnews.xml",   # 要闻导读
+    "https://www.chinanews.com.cn/rss/china.xml",        # 时政
+    "https://www.chinanews.com.cn/rss/scroll-news.xml",  # 即时
+]
+NEWS_FOREIGN_FEEDS = [
+    "https://www.chinanews.com.cn/rss/world.xml",        # 国际
+]
+
+# 可以在这些标点处断句（英文逗号也带上，标题里偶尔混用）
+_CLAUSE_BREAKS = "，,、；;。！!？?"
+
+
+@dataclass
+class NewsSection:
+    """一栏新闻，比如「国内」或「国外」。"""
+
+    label: str
+    items: List[str] = field(default_factory=list)
+
+
 @dataclass
 class NewsDigest:
     date: str = ""
-    items: List[str] = field(default_factory=list)
-    tip: str = ""
+    sections: List[NewsSection] = field(default_factory=list)
+
+    @property
+    def items(self) -> List[str]:
+        """把各栏拉平，方便只想要全部条目的时候用。"""
+        return [x for section in self.sections for x in section.items]
 
 
-async def fetch_news(http: HttpClient) -> NewsDigest:
-    data = await http.get_json(NEWS_60S)
-    payload = _as_dict(_as_dict(data).get("data"))
-    if not payload:
-        raise CommandDataError("新闻接口返回格式异常")
-    items = [str(x).strip() for x in _as_list(payload.get("news")) if str(x).strip()]
-    if not items:
-        raise CommandDataError("今天没拿到新闻内容")
-    return NewsDigest(
-        date=str(payload.get("date") or ""),
-        items=items,
-        tip=str(payload.get("tip") or "").strip(),
+def _clean_title(raw: str) -> str:
+    """去掉实体、压缩空白、剥掉「原标题：」这类前缀。"""
+    text = html.unescape(raw or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^(原标题|摘要|导读)[：:]\s*", "", text)
+    return text.strip()
+
+
+def _shorten(title: str, target: int) -> str:
+    """把标题压到 target 字左右，优先在句读处断开，尽量别硬切。"""
+    hard = max(target + 4, int(round(target * 1.4)))
+    if len(title) <= hard:
+        return title
+    for window in (target, hard):
+        cut = max(title.rfind(ch, 0, window + 1) for ch in _CLAUSE_BREAKS)
+        if cut >= max(6, target // 2):
+            return title[:cut].rstrip()
+    return title[:hard].rstrip() + "…"
+
+
+def _pick_titles(titles: Sequence[str], count: int, target: int) -> List[str]:
+    """按原始顺序挑 count 条。
+
+    优先挑长度本来就接近 target 的，这样绝大多数标题不用截断就能用；
+    不够再从长标题里裁。这样比「先取前 N 条再砍」出来的东西干净得多。
+    """
+    if count <= 0:
+        return []
+    hard = max(target + 4, int(round(target * 1.4)))
+
+    cleaned: List[str] = []
+    seen = set()
+    for raw in titles:
+        text = _clean_title(raw)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        cleaned.append(text)
+
+    chosen = [t for t in cleaned if len(t) <= hard][:count]
+    if len(chosen) < count:
+        for text in cleaned:
+            if len(chosen) >= count:
+                break
+            if text in chosen:
+                continue
+            chosen.append(_shorten(text, target))
+    return chosen[:count]
+
+
+def parse_rss_titles(xml_text: str) -> List[str]:
+    """从中新网这类标准 RSS 里抠出所有 <item><title>。"""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise CommandDataError(f"新闻源不是合法 RSS：{exc}") from exc
+    titles: List[str] = []
+    for node in root.iter("item"):
+        title = node.findtext("title") or ""
+        if title.strip():
+            titles.append(title)
+    return titles
+
+
+async def _collect(http: HttpClient, feeds: Sequence[str], count: int, target: int) -> List[str]:
+    """按兜底链把某一栏凑够 count 条；单个源失败只记日志，不影响其它源。"""
+    if count <= 0:
+        return []
+    picked: List[str] = []
+    for url in feeds:
+        if len(picked) >= count:
+            break
+        try:
+            xml_text = await http.get_text(url)
+            titles = parse_rss_titles(xml_text)
+        except Exception as exc:  # noqa: BLE001 - 换下一个源就好
+            log.warning("新闻源取失败（跳过）：%s -> %s", url, exc)
+            continue
+        for text in _pick_titles(titles, count - len(picked), target):
+            if text not in picked:
+                picked.append(text)
+    return picked[:count]
+
+
+async def fetch_news(
+    http: HttpClient,
+    *,
+    domestic: int = 5,
+    foreign: int = 5,
+    item_chars: int = 20,
+) -> NewsDigest:
+    """取国内、国外新闻各若干条，每条压到 item_chars 字左右。
+
+    两栏并发抓；某一栏彻底取不到时只丢那一栏，另一栏照样播 —— 有半份新闻
+    也好过整条播报静默失败。
+    """
+    domestic_titles, foreign_titles = await asyncio.gather(
+        _collect(http, NEWS_DOMESTIC_FEEDS, int(domestic), item_chars),
+        _collect(http, NEWS_FOREIGN_FEEDS, int(foreign), item_chars),
     )
 
+    sections: List[NewsSection] = []
+    # 按需求里说的顺序：先国外，后国内
+    if foreign_titles:
+        sections.append(NewsSection(label="国外", items=foreign_titles))
+    else:
+        log.warning("国外新闻没取到，本次只播国内")
+    if domestic_titles:
+        sections.append(NewsSection(label="国内", items=domestic_titles))
+    else:
+        log.warning("国内新闻没取到，本次只播国外")
 
-def summarize_news(digest: NewsDigest, max_chars: int = 200, max_items: int = 6) -> str:
-    """把新闻压成 ~200 字的摘要（不调 AI，纯截断拼装）。"""
-    picked: List[str] = []
-    total = 0
-    for item in digest.items:
-        # 每条压到一句，去掉多余空白
-        one = re.sub(r"\s+", " ", item).strip()
-        if not one:
-            continue
-        if len(one) > 60:
-            cut = max(one.rfind("，", 0, 60), one.rfind("。", 0, 60), one.rfind("：", 0, 60))
-            one = one[: cut + 1] if cut > 20 else one[:60] + "…"
-        if total + len(one) > max_chars and picked:
-            break
-        picked.append(f"· {one}")
-        total += len(one)
-        if len(picked) >= max_items:
-            break
-    if not picked:
-        raise CommandDataError("新闻内容为空")
+    if not sections:
+        raise CommandDataError("国内、国外新闻都没取到")
+
+    return NewsDigest(date=datetime.now().strftime("%m-%d"), sections=sections)
+
+
+def render_news(digest: NewsDigest) -> str:
+    """把 NewsDigest 拼成要发出去的文本。"""
+    lines: List[str] = []
     header = "今日要闻"
     if digest.date:
         header += f"（{digest.date}）"
-    return header + "\n" + "\n".join(picked)
+    lines.append(header)
+    for section in digest.sections:
+        if not section.items:
+            continue
+        lines.append(f"【{section.label}】")
+        lines.extend(f"· {text}" for text in section.items)
+    if len(lines) <= 1:
+        raise CommandDataError("新闻内容为空")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

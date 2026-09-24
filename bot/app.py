@@ -130,7 +130,7 @@ class QQBot:
         if not self.settings.news_enabled or self._cmd_http is None:
             return
 
-        from .commands.sources import CommandDataError, fetch_news, summarize_news
+        from .commands.sources import CommandDataError, fetch_news, render_news
 
         while True:
             delay = self._seconds_until(self.settings.news_time)
@@ -145,8 +145,13 @@ class QQBot:
             await asyncio.sleep(delay)
 
             try:
-                digest = await fetch_news(self._cmd_http)
-                text = summarize_news(digest, max_chars=self.settings.news_max_chars)
+                digest = await fetch_news(
+                    self._cmd_http,
+                    domestic=self.settings.news_domestic,
+                    foreign=self.settings.news_foreign,
+                    item_chars=self.settings.news_item_chars,
+                )
+                text = render_news(digest)
                 await self._broadcast(text, label="今日新闻")
             except CommandDataError as exc:
                 log.warning("新闻播报取数据失败: %s", exc)

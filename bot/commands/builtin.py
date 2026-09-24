@@ -17,8 +17,8 @@ from .sources import (
     fetch_character_image,
     fetch_news,
     fortune_for,
+    render_news,
     search_song,
-    summarize_news,
 )
 
 log = get_logger(__name__)
@@ -138,12 +138,18 @@ async def cmd_waifu(ctx: CommandContext) -> CommandResult:
 # ---------------------------------------------------------------------------
 # 今日新闻
 # ---------------------------------------------------------------------------
-@registry.register("新闻", aliases=["news", "今日新闻"], help_text="看看今天的新闻摘要")
+@registry.register("新闻", aliases=["news", "今日新闻"], help_text="看看今天的国内外新闻摘要")
 async def cmd_news(ctx: CommandContext) -> CommandResult:
     if ctx.http is None:
         return CommandResult.of("新闻服务没启动。")
-    digest = await fetch_news(ctx.http)
-    return CommandResult.of(summarize_news(digest))
+    settings = ctx.settings
+    digest = await fetch_news(
+        ctx.http,
+        domestic=getattr(settings, "news_domestic", 5),
+        foreign=getattr(settings, "news_foreign", 5),
+        item_chars=getattr(settings, "news_item_chars", 20),
+    )
+    return CommandResult.of(render_news(digest))
 
 
 # ---------------------------------------------------------------------------
