@@ -815,6 +815,35 @@ async def main() -> int:
             last = fake_ai.requests[-1]["messages"][-1]["content"]
             check("语音转出的文字进入上下文", "这是语音转出来的文字" in last, last[:150])
 
+        # ---------------- 22. 输出不留空行 ----------------
+        section("22. 输出消息不留空行")
+        limiter._hits.clear()
+        limiter._global.clear()
+        napcat.clear()
+        # /帮助 的输出里本来带好几处空行，走完清理应该一个都不剩
+        await napcat.push(make_event(2100, group=True, user_id=USER_A, text="/帮助", at_bot=False))
+        got = await wait_until(lambda: len(napcat.sent()) >= 1, timeout=8)
+        check("帮助指令有输出", got, str(napcat.sent()))
+        if got:
+            for i, params in enumerate(napcat.sent()):
+                txt = segments_to_text(params["message"])
+                blanks = [j for j, line in enumerate(txt.split("\n")) if not line.strip()]
+                check(f"第 {i+1} 条消息无空行", not blanks, f"空行位置={blanks}")
+
+        # AI 回复里塞了空行，也要被清掉
+        section("22b. AI 回复里的空行同样被清理")
+        fake_ai.reply_builder = lambda n, p: "第一行\n\n\n第二行\n  \n第三行"
+        napcat.clear()
+        await napcat.push(make_event(2101, group=True, user_id=USER_A, text="随便说点", at_bot=True))
+        got = await wait_until(lambda: len(napcat.sent()) >= 1, timeout=10)
+        check("AI 回复发出了", got, str(napcat.sent()))
+        if got:
+            txt = segments_to_text(napcat.sent()[0]["message"])
+            blanks = [j for j, line in enumerate(txt.split("\n")) if not line.strip()]
+            check("AI 回复无空行", not blanks, f"内容={txt!r}")
+            check("内容没被误删", "第一行" in txt and "第二行" in txt and "第三行" in txt, txt)
+        fake_ai.reply_builder = None
+
     finally:
         bot_task.cancel()
         try:

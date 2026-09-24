@@ -187,6 +187,8 @@ class Settings:
     max_reply_chars: int = 1200
     reply_with_quote: bool = False
     strip_markdown: bool = True
+    # 去掉消息里的空行（QQ 里空行占地方又显乱）
+    strip_blank_lines: bool = True
 
     # ---------- 运行 ----------
     log_level: str = "INFO"
@@ -266,6 +268,7 @@ class Settings:
             max_reply_chars=env.int("MAX_REPLY_CHARS", 1200),
             reply_with_quote=env.bool("REPLY_WITH_QUOTE", False),
             strip_markdown=env.bool("STRIP_MARKDOWN", True),
+            strip_blank_lines=env.bool("STRIP_BLANK_LINES", True),
             log_level=env.str("LOG_LEVEL", "INFO").upper(),
             log_file=env.str("LOG_FILE", "logs/bot.log"),
             env_file=env_path,

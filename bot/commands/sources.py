@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import quote, urlencode
 
 from ..log import get_logger
+from ..netutil import is_loopback
 
 log = get_logger(__name__)
 
@@ -49,24 +50,36 @@ class HttpClient:
             raise CommandDataError("缺少 httpx 依赖")
         self.timeout = timeout
         self._client: Optional[Any] = None
+        self._local_client: Optional[Any] = None
 
-    async def _c(self) -> Any:
+    def _new_client(self, trust_env: bool) -> Any:
+        return httpx.AsyncClient(
+            timeout=self.timeout,
+            headers={"User-Agent": UA},
+            follow_redirects=True,
+            trust_env=trust_env,
+        )
+
+    async def _c(self, url: str = "") -> Any:
+        """本地地址不吃系统代理（否则 Windows 上会被代理劫持返回 502）。"""
+        if url and is_loopback(url):
+            if self._local_client is None:
+                self._local_client = self._new_client(trust_env=False)
+            return self._local_client
         if self._client is None:
-            self._client = httpx.AsyncClient(
-                timeout=self.timeout,
-                headers={"User-Agent": UA},
-                follow_redirects=True,
-            )
+            self._client = self._new_client(trust_env=True)
         return self._client
 
     async def aclose(self) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        for attr in ("_client", "_local_client"):
+            client = getattr(self, attr, None)
+            if client is not None:
+                await client.aclose()
+                setattr(self, attr, None)
 
     async def get_json(self, url: str, *, headers: Optional[Dict[str, str]] = None,
                        params: Optional[Dict[str, Any]] = None) -> Any:
-        client = await self._c()
+        client = await self._c(url)
         try:
             resp = await client.get(url, headers=headers, params=params)
         except Exception as exc:
@@ -109,31 +122,89 @@ class Song:
         return f"{total // 60}:{total % 60:02d}"
 
 
+def _as_dict(value: Any) -> Dict[str, Any]:
+    """接口偶尔会返回字符串（限流页、重定向页），统一挡掉。"""
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> List[Any]:
+    return value if isinstance(value, list) else []
+
+
+# 网易云搜索端点。注意：
+# /api/search/get/web 会间歇性返回**加密字符串**而不是 JSON（反爬），
+# 所以这里按顺序回退，用第一个能正常解析的。
+NETEASE_ENDPOINTS: Sequence[str] = (
+    "https://music.163.com/api/cloudsearch/pc",
+    "https://music.163.com/api/search/get",
+    "https://music.163.com/api/search/get/web",
+)
+
+
 async def search_song(http: HttpClient, keyword: str, limit: int = 5) -> List[Song]:
-    data = await http.get_json(
-        NETEASE_SEARCH,
-        headers={"Referer": "https://music.163.com/", "User-Agent": UA},
-        params={"csrf_token": "", "s": keyword, "type": 1, "offset": 0, "total": "true", "limit": limit},
-    )
-    songs_raw = ((data or {}).get("result") or {}).get("songs") or []
+    hdrs = {"Referer": "https://music.163.com/", "User-Agent": UA}
+    last_error: Optional[Exception] = None
+
+    for url in NETEASE_ENDPOINTS:
+        try:
+            data = await http.get_json(
+                url,
+                headers=hdrs,
+                params={"s": keyword, "type": 1, "offset": 0, "limit": limit,
+                        "total": "true", "csrf_token": ""},
+            )
+        except CommandDataError as exc:
+            last_error = exc
+            continue
+
+        root = _as_dict(data)
+        result = _as_dict(root.get("result"))
+        if not result:
+            # 加密串 / 限流页 —— 换下一个端点
+            log.debug("网易云端点 %s 未返回可用结果，尝试下一个", url)
+            last_error = CommandDataError("网易云返回了加密内容（反爬）")
+            continue
+
+        songs = _parse_netease_songs(_as_list(result.get("songs")))
+        if songs:
+            return songs
+
+    if last_error:
+        log.warning("网易云搜索全部端点失败: %s", last_error)
+    return []
+
+
+def _parse_netease_songs(items: List[Any]) -> List[Song]:
+    """解析歌曲列表。
+
+    注意两个端点的字段名不同，这里两种都认：
+        cloudsearch/pc : ar / al / dt
+        search/get     : artists / album / duration
+    """
     songs: List[Song] = []
-    for item in songs_raw:
+    for item in items:
         if not isinstance(item, dict):
             continue
+
+        raw_artists = item.get("artists") or item.get("ar")
         artists = "、".join(
-            str(a.get("name", "")) for a in (item.get("artists") or []) if isinstance(a, dict)
+            str(a.get("name", "")) for a in _as_list(raw_artists) if isinstance(a, dict) and a.get("name")
         ) or "未知歌手"
+
         album = ""
-        album_raw = item.get("album") or {}
+        album_raw = item.get("album") or item.get("al")
         if isinstance(album_raw, dict):
             album = str(album_raw.get("name") or "")
+
+        duration = item.get("duration") or item.get("dt") or 0
+
         songs.append(
             Song(
                 song_id=int(item.get("id") or 0),
                 name=str(item.get("name") or "未知歌曲"),
                 artists=artists,
                 album=album,
-                duration_ms=int(item.get("duration") or 0),
+                duration_ms=int(duration),
             )
         )
     return songs
@@ -151,10 +222,10 @@ class NewsDigest:
 
 async def fetch_news(http: HttpClient) -> NewsDigest:
     data = await http.get_json(NEWS_60S)
-    payload = (data or {}).get("data") or {}
-    if not isinstance(payload, dict):
+    payload = _as_dict(_as_dict(data).get("data"))
+    if not payload:
         raise CommandDataError("新闻接口返回格式异常")
-    items = [str(x).strip() for x in (payload.get("news") or []) if str(x).strip()]
+    items = [str(x).strip() for x in _as_list(payload.get("news")) if str(x).strip()]
     if not items:
         raise CommandDataError("今天没拿到新闻内容")
     return NewsDigest(
@@ -277,7 +348,7 @@ async def _lolicon_query(http: HttpClient, keyword: str) -> List[dict]:
     except CommandDataError as exc:
         log.debug("图库查询失败(%s): %s", keyword, exc)
         return []
-    items = (data or {}).get("data") or []
+    items = _as_list(_as_dict(data).get("data"))
     return [i for i in items if isinstance(i, dict) and _is_safe(i)]
 
 

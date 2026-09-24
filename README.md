@@ -571,6 +571,170 @@ NapCat 的 WebUI 在 <http://127.0.0.1:6099>，扫码登录后即可使用。
 
 ---
 
+## 老是掉线？先看这里
+
+### 现象
+
+机器人隔一阵就"消失"，NapCat 日志里能看到：
+
+```
+[KickedOffLine] [下线通知] 你的账号当前登录已失效，请重新登录。
+账号状态变更为离线
+[Core] [Login] 账号被踢下线，正在重启 Worker 以重新创建 QQ 登录服务
+```
+
+被踢之后 NapCat 只能重新生成二维码，没人扫就一直离线 —— 所以从群友视角看，就是"机器人死了"。
+
+### 这是腾讯风控，不是代码问题
+
+在阿里云这类**机房 IP** 上用非官方客户端（NapCat）登录 QQ，会被腾讯风控周期性踢下线。
+实测数据：**29 小时内被踢 10 次，平均在线 3.2 小时，最短 14 分钟**。同期容器
+`RestartCount=0`、`OOMKilled=false`、内存富余，被踢前 15 分钟机器人**一条消息都没发**，
+所以跟内存、崩溃、发消息频率、双端抢登都无关。
+
+社区已有大量同环境复现，见
+[NapCatQQ Issue #1728](https://github.com/NapNeko/NapCatQQ/issues/1728)。
+结论大致是：**Docker 版 NapCat 最容易被踢**，换非 Docker 的 Linux Launcher 并开启反检测
+有人能稳定一周以上；早期"降级到 4.15.x"的方案现在已失效（内置 QQ 版本太旧，腾讯禁止登录）。
+
+> 注意：持续被风控可能升级为**封号**。请务必用小号，并配合下面的自愈手段。
+
+### 保底手段 1：快速登录 + 重启自愈（实测有效）
+
+`docker-compose.yml` 里已经打开：
+
+```yaml
+environment:
+  - ACCOUNT=${BOT_QQ:-}     # .env 里写 BOT_QQ=你的机器人QQ号
+```
+
+它会让 NapCat 用 `qq --no-sandbox -q $ACCOUNT` 启动。
+
+实测数据点（2026-09-25）：
+
+| 操作 | 结果 |
+|---|---|
+| 掉线后干等（不重启容器） | QR 每 2 分钟重生一次，一直离线 |
+| `docker restart napcat` | **21 秒后 3001 恢复 LISTEN，不需要扫码** |
+
+日志长这样，`快速登录` 后面**没有** `快速登录错误` 就是成功了：
+
+```
+01:30:48 [info] [NapCat] [Core] NapCat.Core Version: 4.18.28
+01:30:49 [info] 正在快速登录  3104685327
+01:30:50 [info] [OneBot] [WebSocket Server] Server Started :::3001
+```
+
+> 日志里如果出现 `快速登录错误： 登录态已失效，请重新登录。` 也不用紧张 ——
+> 那只是 `-q` 这一条路径失败，Worker 往往还会用本地会话数据自己登回来
+> （实测有过「打了这行错误，但 1 秒后 3001 就起来了」的情况）。
+> **真正可靠的判据是 3001 有没有 LISTEN，不是这行日志。**
+
+### 保底手段 2：掉线看门狗（推荐）
+
+`scripts/napcat-watchdog.sh` 由 systemd timer 每分钟跑一次：
+
+| 情况 | 动作 |
+|---|---|
+| 掉线 | `docker restart napcat` 自动恢复，最多 3 次（每次间隔 150 秒，够它登回来） |
+| 3 次都救不回来 | 记录 + 通知（可配 webhook）+ 等你人工扫码，期间只写心跳 |
+| 恢复在线 | 自动重置状态 |
+
+探活判据是**容器内 3001 是否 LISTEN**。注意 napcat 容器里**没有 `ss`/`netstat`/`lsof`**
+（早期版本用 `ss` 判断，结果永远返回"离线"，是个真 bug），现在改成读 `/proc/net/tcp`：
+
+```bash
+grep -i ':0BB9 ' /proc/net/tcp /proc/net/tcp6 | grep -q ' 0A '   # 0BB9 = 3001
+```
+
+OneBot 的 WS 服务是 QQ 登录成功之后才起来的，所以这个判据等价于"已登录"。
+
+装在服务器上（需要 root）：
+
+```bash
+sudo bash scripts/install-watchdog.sh          # 安装 + 立即跑一轮
+bash scripts/napcat-watchdog.sh --status       # 看登录状态 / 被踢记录 / 当前二维码链接
+bash scripts/napcat-watchdog.sh --reset        # 清状态（一般不用手动做）
+sudo bash scripts/install-watchdog.sh uninstall
+```
+
+日志在 `logs/watchdog.log`。
+
+想让它主动通知你：把 webhook 地址写进项目根目录的 `.watchdog-webhook`（一行），
+掉线时会 POST `title=真红bot 掉线&desp=...&text=...`（Server酱 / PushPlus 之类的表单接收端直接可用）。
+
+### 保底手段 3：重新扫码
+
+```bash
+# Linux/macOS
+docker cp napcat:/app/napcat/cache/qrcode.png ./qr.png && xdg-open ./qr.png
+```
+```powershell
+# Windows（本仓库附带的辅助脚本）
+.\.ssh\qr-loop.ps1        # 扫码成功前一直刷新最新二维码到屏幕上
+```
+
+二维码约 2 分钟过期，过期会自动重新生成，重新拉一次即可。
+
+### 想真正少被踢
+
+**第 1 步（最重要，已经做了）：打开反检测**
+
+NapCat 自带一页「反检测配置」，对应 `napcat.json` 里的 `bypass` 字段，
+控制 Napi2Native 模块的各项反检测能力：
+
+| 字段 | WebUI 标签 | 含义 |
+|---|---|---|
+| `hook` | Hook | hook 特征隐藏 |
+| `window` | Window | 窗口伪造 |
+| `module` | Module | 加载模块隐藏 |
+| `process` | Process | 进程反检测 |
+| `container` | Container | **容器反检测**（跑 Docker 时最相关） |
+| `js` | JS | JS 反检测 |
+
+**Docker 镜像自带的模板里这六个全是 `false`，也就是反检测全关。** 一键打开：
+
+```bash
+bash scripts/enable-anti-detection.sh          # 打开并自动重启 NapCat
+bash scripts/enable-anti-detection.sh show     # 看当前值
+bash scripts/enable-anti-detection.sh off      # 关掉
+```
+
+⚠️ 注意 NapCat 真正加载的是**按账号**的那份 `data/napcat/config/napcat_<QQ>.json`
+（日志里的 `[Core] [Config] 配置文件...加载`），全局 `napcat.json` 只是模板 ——
+脚本两个都会改。改完看日志确认生效：
+
+```
+[Core] [Config] 配置文件/app/napcat/config/napcat_3104685327.json加载 {"o3HookMode":1,
+ "bypass":{"hook":true,"window":true,"module":true,"process":true,"container":true,"js":true}}
+```
+
+**第 2 步：如果还是频繁被踢，再考虑换部署方式**
+
+1. **换非 Docker 部署**：用 NapCat Linux Launcher 原生跑最新版
+2. **换住宅 IP**：把协议端放在家里电脑上，云服务器只跑机器人
+3. ⚠️ 不要指望降级 NapCat 版本 —— 旧版内置的 QQ 已被腾讯禁止登录
+4. ⚠️ 社区里也有人反馈**换非 Docker 后照样频繁掉线**
+   （[#1728](https://github.com/NapNeko/NapCatQQ/issues/1728) 里两种案例都有），
+   所以这属于「值得一试但不保证」，别期待值拉太满
+
+### 怎么判断反检测有没有用
+
+看 NapCat 日志里 `KickedOffLine` 的间隔。改造前的基线是：
+
+| 指标 | 改造前 |
+|---|---|
+| 被踢次数 | 28.8 小时内 10 次 |
+| 平均在线时长 | 3.20 小时 |
+| 最短 / 最长 | 14 分钟 / 9.2 小时 |
+
+```bash
+# 一行看被踢次数
+docker logs napcat 2>&1 | grep -c KickedOffLine
+```
+
+---
+
 ## 项目结构
 
 ```
@@ -598,6 +762,10 @@ qq-deepseek-bot/
 │  └─ test_rhythm.py       # 音游模块离线自测（固定数据，不联网）
 ├─ Dockerfile
 ├─ docker-compose.yml
+├─ scripts/
+│  ├─ napcat-watchdog.sh         # ★ 掉线自愈看门狗（systemd timer 每分钟跑）
+│  ├─ install-watchdog.sh        #   安装/卸载上面那个 systemd 服务
+│  └─ enable-anti-detection.sh   # ★ 打开 NapCat 内置反检测（bypass 开关）
 ├─ start.bat               # ★ 双击启动（NapCat + 机器人，登录后自动转后台）
 ├─ stop.bat                # ★ 双击停止（只关自己启动的进程）
 ├─ start.ps1 / stop.ps1    #   上面两个 bat 的实际实现
@@ -648,6 +816,10 @@ NapCat 内置的 QQ 下载链接已失效（腾讯轮换了带哈希的路径）
 2. 确认 `.env` 里的 `ONEBOT_WS_URL` 端口与 NapCat 里配置的一致
 3. 如果 NapCat 设置了 Token，`.env` 里的 `ONEBOT_ACCESS_TOKEN` 必须完全一致
 4. 跑 `python run.py --check` 看具体报错
+
+**机器人隔几小时就掉线一次**
+这是腾讯风控在踢号，不是代码问题 —— 见上面的[「老是掉线？先看这里」](#老是掉线先看这里)，
+装 `scripts/install-watchdog.sh` 让掉线至少能被发现、能自愈。
 
 **机器人不回复**
 1. 群里必须 @ 它（且 @ 的是真的那个 QQ 号）

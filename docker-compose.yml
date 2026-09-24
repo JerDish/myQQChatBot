@@ -18,6 +18,12 @@ services:
       - NAPCAT_UID=0
       - NAPCAT_GID=0
       - TZ=Asia/Shanghai
+      # ACCOUNT 会让 entrypoint 用「快速登录」启动 QQ：
+      #     gosu napcat /opt/QQ/qq --no-sandbox -q $ACCOUNT
+      # 不设的话，每次被踢下线都只能干等人工扫码（日志里的
+      # 「没有 -q 指令指定快速登录，将使用二维码登录方式」）。
+      # 配合 scripts/napcat-watchdog.sh，静默掉线时可以自愈。
+      - ACCOUNT=${BOT_QQ:-}
     # 不映射到公网：WebUI 通过 SSH 隧道访问（ssh -L 6099:127.0.0.1:6099 ...）
     expose:
       - "3001"

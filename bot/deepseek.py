@@ -12,6 +12,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from .log import get_logger
+from .netutil import trust_env_for
 
 log = get_logger(__name__)
 
@@ -55,6 +56,8 @@ class DeepSeekClient:
                 self._client = httpx.AsyncClient(
                     base_url=self.base_url,
                     timeout=httpx.Timeout(self.timeout, connect=15.0),
+                    # 本地地址（自建代理、假服务、转发）不走系统代理
+                    trust_env=trust_env_for(self.base_url),
                     headers={
                         "Authorization": f"Bearer {self.api_key}",
                         "Content-Type": "application/json",

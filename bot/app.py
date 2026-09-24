@@ -284,9 +284,10 @@ class QQBot:
             return 0
 
         sent = 0
+        clean = self._clean(text, self.settings.strip_markdown)
         for group_id in targets:
             try:
-                await self.client.send_group_msg(group_id, [text_segment(text)])
+                await self.client.send_group_msg(group_id, [text_segment(clean)])
                 sent += 1
             except OneBotError as exc:
                 log.error("向群 %s 发送%s失败: %s", group_id, label, exc)
@@ -785,6 +786,8 @@ class QQBot:
             .replace("{user_id}", str(uid))
             .replace("{nickname}", nickname or "新朋友")
         )
+        # 去掉模板里多余的空行，避免发出去一坨空白
+        rendered = "\n".join(l for l in rendered.split("\n") if l.strip())
         segments: List[Dict[str, Any]] = []
         if "{at}" in rendered:
             head, _, tail = rendered.partition("{at}")
@@ -982,14 +985,16 @@ class QQBot:
             chunks.append(remaining.strip())
         return chunks
 
-    @staticmethod
-    def _clean(text: str, strip_markdown: bool) -> str:
+    def _clean(self, text: str, strip_markdown: bool) -> str:
         text = text.replace("\r\n", "\n").strip()
-        if not strip_markdown:
-            return text
-        for pattern, repl in _MD_PATTERNS:
-            text = re.sub(pattern, repl, text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
+        if strip_markdown:
+            for pattern, repl in _MD_PATTERNS:
+                text = re.sub(pattern, repl, text)
+        # QQ 里空行很占地方，看上去也乱；默认整段去掉
+        if getattr(self.settings, "strip_blank_lines", True):
+            text = "\n".join(line for line in text.split("\n") if line.strip())
+        else:
+            text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
 
     # 供测试/外部调用：模拟一条消息的处理
