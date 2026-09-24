@@ -1,0 +1,17 @@
+# 统一行尾，避免「Windows 上 checkout 出 CRLF 的 .sh，拿到 Linux 上跑不了」
+* text=auto eol=lf
+
+# Windows 专用脚本保持 CRLF（还有些老工具认 CRLF，比如记事本和 PS 5.1 的某些路径）
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Linux 脚本必须是 LF，否则 bash 会报 `/bin/bash^M: bad interpreter`
+*.sh text eol=lf
+
+# 二进制/资源，不要做行尾转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.gz binary
+*.zip binary
