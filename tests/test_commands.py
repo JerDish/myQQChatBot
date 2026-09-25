@@ -238,6 +238,63 @@ def test_pending_selection() -> None:
     check("空 pending 不崩", consume_pending_selection("u1", "1", {}) is None)
 
 
+def test_music_candidates() -> None:
+    section("7b. 点歌：候选只要 3 首，且先挑像样的")
+    from bot.commands.builtin import MUSIC_CANDIDATES, _pick_best_songs
+    from bot.commands.sources import Song
+
+    check("候选数量是 3", MUSIC_CANDIDATES == 3, str(MUSIC_CANDIDATES))
+
+    # 模拟网易云搜索：原唱、翻唱、伴奏、还有一条没封面没时长的脏数据混在一起
+    pool = [
+        Song(1, "花之塔", "薬師るり", "花之塔", 246000),
+        Song(2, "花之塔（伴奏）", "某某", "翻唱合集", 246000),
+        Song(3, "花之塔 - 纯音乐", "无名", "", 0),
+        Song(4, "花之塔", "さユり", "花之塔", 240000),
+        Song(5, "花之塔", "翻唱歌手", "", 239000),
+        Song(6, "花之塔（钢琴版）", "piano", "钢琴", 250000),
+        Song(7, "花之塔", "Another", "Single", 245000),
+    ]
+    picked = _pick_best_songs(pool, MUSIC_CANDIDATES)
+    check("只挑 3 首", len(picked) == 3, str([s.name for s in picked]))
+    check(
+        "伴奏/纯音乐/翻唱被排到最后",
+        all("伴奏" not in s.name and "纯音乐" not in s.name and "钢琴版" not in s.name for s in picked),
+        str([s.name for s in picked]),
+    )
+    check("优先选有封面有时间的", all(s.duration_ms and s.album for s in picked), str([(s.name, s.album) for s in picked]))
+    check("原唱排在第一位", picked[0].artists == "薬師るり", picked[0].artists)
+
+    # 真实场景：网易云「花之塔」返回的这一批（去掉噪声后应该只剩干净的原唱和同名翻唱）
+    real = [
+        Song(1, "花の塔", "さユり", "花の塔", 275000),
+        Song(2, "花の塔", "さユり", "酸欠少女", 275000),
+        Song(3, "花の塔 (花之塔) (TV动画《莉可丽丝》片尾曲)（翻自 酸欠少女さユり）", "Hyan紫炫", "翻唱", 101000),
+        Song(4, "花之塔", "Ices", "花之塔/花の塔", 101000),
+        Song(5, "花之舞（Flower Dance）", "  ", "ㅤ", 257000),
+        Song(6, "花之舞（伴奏）", "Brian Cheng", "花之舞", 267000),
+        Song(7, "花之塔（钢琴）", "十七场雨", "同手同脚", 266000),
+        Song(8, "AI小八 / 花之塔(TuneTonic Ver.)", "奥利AULAY、HACHIWARE", "chiikawaRVC翻唱", 276000),
+    ]
+    real_picked = _pick_best_songs(real, 3)
+    check("真实结果里挑出 3 首", len(real_picked) == 3, str([s.name for s in real_picked]))
+    check(
+        "翻唱/伴奏/钢琴都被挤掉",
+        all("（" not in s.name and "(TuneTonic" not in s.name for s in real_picked),
+        str([s.name for s in real_picked]),
+    )
+    check("第一首是原唱", real_picked[0].name == "花の塔" and real_picked[0].artists == "さユり")
+
+    # 名字里带括号就轻罚，不能把正经歌也误伤到排不出来
+    calm = [Song(1, "告白气球", "周杰伦", "周杰伦的床边故事", 215000), Song(2, "晴天", "周杰伦", "叶惠美", 269000)]
+    check("正常歌名不受影响", [s.name for s in _pick_best_songs(calm, 3)] == ["告白气球", "晴天"])
+
+    # 搜索结果本来就少的时候不能凭空多出来
+    check("结果不足 3 首时原样返回", len(_pick_best_songs(pool[:2], MUSIC_CANDIDATES)) == 2)
+    check("空结果返回空", _pick_best_songs([], MUSIC_CANDIDATES) == [])
+    check("脏数据也不会崩", len(_pick_best_songs([Song(9, "", "", "", 0)], 3)) == 1)
+
+
 def test_dishes() -> None:
     section("8. 吃什么")
     from bot.commands.dishes import FUNNY_DISHES, REAL_DISHES, all_dishes, pick_dish, total
@@ -301,6 +358,7 @@ def main() -> int:
     test_fortune_variety()
     test_characters()
     test_pending_selection()
+    test_music_candidates()
     test_dishes()
     test_help_guidance()
 

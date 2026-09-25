@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import random
 import time
-from typing import Any, Optional
+from typing import Any, List, Optional, Sequence
 
 from ..log import get_logger
 from . import CommandContext, CommandResult, registry
@@ -39,7 +39,7 @@ async def cmd_help(ctx: CommandContext) -> CommandResult:
             "  /吃什么      —— 帮你决定吃啥",
             "  /今日运势    —— 看看今天的运气",
             "  /今日老婆    —— 随机抽个老婆",
-            "  /点歌 歌名   —— 搜歌，然后回个数字",
+            "  /点歌 歌名   —— 搜歌，给你 3 首挑，回个数字",
             "  /时间        —— 现在几点",
             "",
             "（私聊我可以看完整列表）",
@@ -60,6 +60,10 @@ async def cmd_help(ctx: CommandContext) -> CommandResult:
 # ---------------------------------------------------------------------------
 # 点歌：两步式（先列候选，再选一首发卡片）
 # ---------------------------------------------------------------------------
+# 候选给几条就够选了；列太多反而挑花眼，而且一屏放不下
+MUSIC_CANDIDATES = 3
+
+
 @registry.register("点歌", aliases=["music", "song"], help_text="搜索歌曲，回复序号选一首（如：/点歌 花之塔）")
 async def cmd_music(ctx: CommandContext) -> CommandResult:
     if not ctx.args:
@@ -68,7 +72,12 @@ async def cmd_music(ctx: CommandContext) -> CommandResult:
     if ctx.http is None:
         return CommandResult.of("点歌服务没启动。")
 
-    songs = await search_song(ctx.http, ctx.args, limit=5)
+    # 多搜几条再挑，这样能避开同名翻唱/伴奏，选出来的前 3 条更准
+    found = await search_song(ctx.http, ctx.args, limit=MUSIC_CANDIDATES * 3)
+    if not found:
+        return CommandResult.of(f"网易云上没找到「{ctx.args}」。")
+
+    songs = _pick_best_songs(found, MUSIC_CANDIDATES)
     if not songs:
         return CommandResult.of(f"网易云上没找到「{ctx.args}」。")
 
@@ -81,7 +90,7 @@ async def cmd_music(ctx: CommandContext) -> CommandResult:
             "at": time.time(),
         }
 
-    lines = [f"为「{ctx.args}」找到这些，回复序号选一首：", ""]
+    lines = [f"为「{ctx.args}」找到这些，回复序号选一首："]
     for i, s in enumerate(songs, 1):
         dur = f"  [{s.duration_text}]" if s.duration_ms else ""
         album = f" · {s.album}" if s.album else ""
@@ -89,6 +98,45 @@ async def cmd_music(ctx: CommandContext) -> CommandResult:
     lines.append("")
     lines.append("直接回复数字即可（例如：1）")
     return CommandResult.of("\n".join(lines), suggest_more=True)
+
+
+def _pick_best_songs(songs: Sequence[Any], count: int) -> List[Any]:
+    """从搜索结果里挑出最值得推荐的 count 首。
+
+    网易云的搜索会把原唱、翻唱、伴奏、纯音乐版混在一起，
+    所以稍微排一下序：优先有封面和时长的（能出完整音乐卡片），
+    再把名字里带「伴奏 / 纯音乐 / 钢琴 / remix」这类词的往后放。
+    """
+    noise = (
+        "伴奏",
+        "纯音乐",
+        "钢琴",
+        "吉他",
+        "翻唱",
+        "翻自",
+        "remix",
+        "cover",
+        "instrumental",
+        "ver.",
+        "tv ver",
+        "live",
+        "dj",
+    )
+
+    def score(song: Any) -> int:
+        name = str(getattr(song, "name", "")).lower()
+        value = 0
+        if getattr(song, "duration_ms", 0):
+            value += 2  # 没时长的大概率是电台或失效资源
+        if getattr(song, "album", ""):
+            value += 1
+        # 名字里出现噪声词，或者带括号的「(Live)」「(TV Size)」这类后缀
+        if any(word in name for word in noise) or "(" in name or "（" in name:
+            value -= 3
+        return value
+
+    ranked = sorted(songs, key=score, reverse=True)
+    return ranked[:count]
 
 
 @registry.register("网易云", aliases=["wyy"], help_text="同 /点歌")
